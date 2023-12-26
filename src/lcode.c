@@ -1,5 +1,5 @@
 /*
-** $Id: lcode.c,v 2.25.1.5 2011/01/31 14:53:16 roberto Exp $
+** $Id: lcode.c,v 2.25.1.3 2007/12/28 15:32:23 roberto Exp $
 ** Code generator for Lua
 ** See Copyright Notice in lua.h
 */
@@ -408,6 +408,13 @@ static void exp2reg (FuncState *fs, expdesc *e, int reg) {
   e->f = e->t = NO_JUMP;
   e->u.s.info = reg;
   e->k = VNONRELOC;
+}
+
+
+void luaK_exp2reg (FuncState *fs, expdesc *e, int reg) {
+  luaK_dischargevars(fs, e);
+  freeexp(fs, e);
+  exp2reg(fs, e, reg);
 }
 
 

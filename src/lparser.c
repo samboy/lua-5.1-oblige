@@ -1,5 +1,5 @@
 /*
-** $Id: lparser.c,v 2.42.1.4 2011/10/21 19:31:42 roberto Exp $
+** $Id: lparser.c,v 2.42.1.3 2007/12/28 15:32:23 roberto Exp $
 ** Lua Parser
 ** See Copyright Notice in lua.h
 */
@@ -40,6 +40,7 @@
 typedef struct BlockCnt {
   struct BlockCnt *previous;  /* chain */
   int breaklist;  /* list of jumps out of this loop */
+  int continuelist;  /* list of jumps to the loop's test */
   lu_byte nactvar;  /* # active locals outside the breakable structure */
   lu_byte upval;  /* true if some variable in the block is an upvalue */
   lu_byte isbreakable;  /* true if `block' is a loop */
@@ -284,6 +285,7 @@ static void enterlevel (LexState *ls) {
 
 static void enterblock (FuncState *fs, BlockCnt *bl, lu_byte isbreakable) {
   bl->breaklist = NO_JUMP;
+  bl->continuelist = NO_JUMP;
   bl->isbreakable = isbreakable;
   bl->nactvar = fs->nactvar;
   bl->upval = 0;
@@ -507,7 +509,8 @@ static void constructor (LexState *ls, expdesc *t) {
   init_exp(&cc.v, VVOID, 0);  /* no value (yet) */
   luaK_exp2nextreg(ls->fs, t);  /* fix it at stack top (for gc) */
   checknext(ls, '{');
-  do {
+  for (;;) {
+    int itemline = ls->linenumber;
     lua_assert(cc.v.k == VVOID || cc.tostore > 0);
     if (ls->t.token == '}') break;
     closelistfield(fs, &cc);
@@ -529,7 +532,11 @@ static void constructor (LexState *ls, expdesc *t) {
         break;
       }
     }
-  } while (testnext(ls, ',') || testnext(ls, ';'));
+    // -AJA- 2011/04/14: data tables: optional commas at end of a line
+    if (! (testnext(ls, ',') || testnext(ls, ';')))
+      if (ls->linenumber == itemline)
+        break;
+  }
   check_match(ls, '}', '{', line);
   lastlistfield(fs, &cc);
   SETARG_B(fs->f->code[pc], luaO_int2fb(cc.na)); /* set initial array size */
@@ -988,6 +995,23 @@ static void breakstat (LexState *ls) {
 }
 
 
+static void continuestat (LexState *ls) {
+  FuncState *fs = ls->fs;
+  BlockCnt *bl = fs->bl;
+  int upval = 0;
+  while (bl && !bl->isbreakable) {
+    upval |= bl->upval;
+    bl = bl->previous;
+  }
+  if (!bl)
+    luaX_syntaxerror(ls, "no loop to continue");
+  if (upval)
+    luaK_codeABC(fs, OP_CLOSE, bl->nactvar, 0, 0);
+  luaK_concat(fs, &bl->continuelist, luaK_jump(fs));
+}
+
+
+
 static void whilestat (LexState *ls, int line) {
   /* whilestat -> WHILE cond DO block END */
   FuncState *fs = ls->fs;
@@ -1001,6 +1025,7 @@ static void whilestat (LexState *ls, int line) {
   checknext(ls, TK_DO);
   block(ls);
   luaK_patchlist(fs, luaK_jump(fs), whileinit);
+  luaK_patchlist(fs, bl.continuelist, whileinit);  /* continue goes to start, too */
   check_match(ls, TK_END, TK_WHILE, line);
   leaveblock(fs);
   luaK_patchtohere(fs, condexit);  /* false conditions finish the loop */
@@ -1017,6 +1042,7 @@ static void repeatstat (LexState *ls, int line) {
   enterblock(fs, &bl2, 0);  /* scope block */
   luaX_next(ls);  /* skip REPEAT */
   chunk(ls);
+  luaK_patchtohere(fs, bl1.continuelist);
   check_match(ls, TK_UNTIL, TK_REPEAT, line);
   condexit = cond(ls);  /* read condition (inside scope block) */
   if (!bl2.upval) {  /* no upvalues? */
@@ -1057,6 +1083,7 @@ static void forbody (LexState *ls, int base, int line, int nvars, int isnum) {
   block(ls);
   leaveblock(fs);  /* end of scope for declared variables */
   luaK_patchtohere(fs, prep);
+  luaK_patchtohere(fs, bl.previous->continuelist);	/* continue, if any, jumps to here */
   endfor = (isnum) ? luaK_codeAsBx(fs, OP_FORLOOP, base, NO_JUMP) :
                      luaK_codeABC(fs, OP_TFORLOOP, base, 0, nvars);
   luaK_fixline(fs, line);  /* pretend that `OP_FOR' starts the loop */
@@ -1123,6 +1150,95 @@ static void forstat (LexState *ls, int line) {
     default: luaX_syntaxerror(ls, LUA_QL("=") " or " LUA_QL("in") " expected");
   }
   check_match(ls, TK_END, TK_FOR, line);
+  leaveblock(fs);  /* loop scope (`break' jumps to this point) */
+}
+
+
+static int eachexpr (LexState *ls, expdesc *v, int islist)
+{
+  // -AJA- parse an expression and call 'ipairs' or 'pairs' with the
+  //       expression as its single argument.
+
+  const char *funcname = islist ? "ipairs" : "pairs";
+  TString *t_funcname = luaX_newstring(ls, funcname, islist ? 6 : 5);
+
+  FuncState *fs = ls->fs;
+  expdesc f;
+  expdesc args;
+  int base;
+  int nparams;
+  int line;
+
+  init_exp(&f, VGLOBAL, NO_REG);
+  f.u.s.info = luaK_stringK(fs, t_funcname);
+  luaK_exp2nextreg(fs, &f);
+
+///--- funcargs(ls, &f);
+///--- memcpy(v, &f, sizeof(*v));
+
+  line = ls->linenumber;
+  expr(ls, &args);
+  luaK_exp2nextreg(fs, &args);
+  luaK_setmultret(fs, &args);
+
+  lua_assert(f.k == VNONRELOC);
+  lua_assert(hasmultret(args.k));
+  base = f.u.s.info;  // base register for call
+  nparams = LUA_MULTRET;  // open call
+
+  init_exp(v, VCALL, luaK_codeABC(fs, OP_CALL, base, nparams+1, 2));
+  luaK_fixline(fs, line);
+  fs->freereg = base+1;
+
+  return 1;
+}
+
+
+// -AJA- 2011/04/16: implemented this syntactic sugar.
+//       Equivalent to normal for loop with 'ipairs' if one variable is
+//       present or 'pairs' if two variables are given.
+static void eachstat (LexState *ls, int line) {
+  /* eachstat -> EACH [ key, ] val IN expr DO */
+  FuncState *fs = ls->fs;
+  TString *indexname;
+  TString *valuename = NULL;
+  int islist;
+  BlockCnt bl;
+
+  enterblock(fs, &bl, 1);  /* scope for loop and control variables */
+  luaX_next(ls);  /* skip `each' */
+  indexname = str_checkname(ls);  /* first variable name */
+  if (ls->t.token == ',') {
+    luaX_next(ls);
+    valuename = str_checkname(ls);  /* second variable name */
+    islist = 0;
+  } else {
+    valuename = indexname;
+    indexname = luaX_newstring(ls, "_index", 6);
+    islist = 1;
+  }
+
+  {
+  FuncState *fs = ls->fs;
+  expdesc e;
+  int nvars = 0;
+  int line;
+  int base = fs->freereg;
+  /* create control variables */
+  new_localvarliteral(ls, "(for generator)", nvars++);
+  new_localvarliteral(ls, "(for state)", nvars++);
+  new_localvarliteral(ls, "(for control)", nvars++);
+  /* create declared variables */
+  new_localvar(ls, indexname, nvars++);
+  new_localvar(ls, valuename, nvars++);
+  checknext(ls, TK_IN);
+  line = ls->linenumber;
+  adjust_assign(ls, 3, eachexpr(ls, &e, islist), &e);
+  luaK_checkstack(fs, 3);  /* extra space to call generator */
+  forbody(ls, base, line, nvars - 3, 0);
+  }
+
+  check_match(ls, TK_END, TK_EACH, line);
   leaveblock(fs);  /* loop scope (`break' jumps to this point) */
 }
 
@@ -1289,6 +1405,10 @@ static int statement (LexState *ls) {
       forstat(ls, line);
       return 0;
     }
+    case TK_EACH: {  /* stat -> eachstat */
+      eachstat(ls, line);
+      return 0;
+    }
     case TK_REPEAT: {  /* stat -> repeatstat */
       repeatstat(ls, line);
       return 0;
@@ -1313,6 +1433,11 @@ static int statement (LexState *ls) {
       luaX_next(ls);  /* skip BREAK */
       breakstat(ls);
       return 1;  /* must be last statement */
+    }
+    case TK_CONTINUE: {  /* stat -> continuestat */
+      luaX_next(ls);  /* skip CONTINUE */
+      continuestat(ls);
+      return 1;	  /* must be last statement */
     }
     default: {
       exprstat(ls);

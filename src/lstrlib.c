@@ -1,5 +1,5 @@
 /*
-** $Id: lstrlib.c,v 1.132.1.5 2010/05/14 15:34:19 roberto Exp $
+** $Id: lstrlib.c,v 1.132.1.4 2008/07/11 17:27:21 roberto Exp $
 ** Standard library for string operations and pattern-matching
 ** See Copyright Notice in lua.h
 */
@@ -797,6 +797,15 @@ static int str_format (lua_State *L) {
           continue;  /* skip the 'addsize' at the end */
         }
         case 's': {
+          // -AJA- 2017/07/01: allow '%s' to call __tostring metamethod
+          //                   on tables.  A power patch by Doug Currie.
+          if (!lua_isstring(L, arg))
+          {
+            lua_getglobal(L, "tostring");
+            lua_pushvalue(L, arg);
+            lua_call(L, 1, 1);
+            lua_replace(L, arg);
+          }
           size_t l;
           const char *s = luaL_checklstring(L, arg, &l);
           if (!strchr(form, '.') && l >= 100) {
